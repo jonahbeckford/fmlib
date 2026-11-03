@@ -17,6 +17,15 @@ struct
         | End_consumed
 
 
+    (* The token written so far, in an array with spare capacity. Several buffer
+       values share one store, and each reads only its first [n_toks] token,
+       which later writes do not change. *)
+    type store = {
+        mutable slots: Token.t array;
+        mutable used: int;
+    }
+
+
     type t = {
         state:
             State.t;
@@ -36,10 +45,14 @@ struct
                parser? *)
             bool;
 
-        toks:
-            (* Buffered token. The token from [la_ptr] to the end are lookahead
-               token. *)
-            Token.t array;
+        store:
+            (* Buffered token. *)
+            store;
+
+        n_toks:
+            (* The number of buffered token of this buffer. The token from
+               [la_ptr] to [n_toks] are lookahead token. *)
+            int;
 
         _end:
             (* Buffered end of token stream. The end of token stream can only be
@@ -60,8 +73,10 @@ struct
            0;
        is_buffering =
            false;
-       toks =
-           [||];
+       store =
+           {slots = [||]; used = 0};
+       n_toks =
+           0;
        _end =
            No_end}
 
@@ -76,7 +91,7 @@ struct
 
     let count_toks (b: t): int =
         (* Number of token in the buffer. *)
-        Array.length b.toks
+        b.n_toks
 
 
     let count_la_toks (b: t): int =
@@ -107,13 +122,13 @@ struct
         (* An array consisting only of the lookahead token in the buffer. *)
         let len = count_toks b - b.la_ptr
         in
-        Array.sub b.toks b.la_ptr len
+        Array.sub b.store.slots b.la_ptr len
 
 
     let first_lookahead (b: t): Token.t option =
         (* The first lookahead token. *)
         if b.la_ptr < count_toks b then
-            Some b.toks.(b.la_ptr)
+            Some b.store.slots.(b.la_ptr)
         else
             None
 
@@ -124,7 +139,7 @@ struct
                 (b: t)
             : 'a
             =
-            let len = Array.length b.toks in
+            let len = b.n_toks in
             let rec fold i a =
                 if i = len then
                     match b._end with
@@ -133,9 +148,49 @@ struct
                     | _ ->
                         a
                 else
-                    fold (i + 1) (ftok b.toks.(i) a)
+                    fold (i + 1) (ftok b.store.slots.(i) a)
             in
             fold b.la_ptr a
+
+
+    let with_capacity (n: int) (t: Token.t) (b: t): Token.t array =
+        (* A new array of at least [n] slots that starts with the token of [b].
+           [t] fills the unused slots. The capacity grows by a factor of
+           1.618, so the copies of all the growths add up to a constant times
+           the number of token. It stays within [Sys.max_array_length], which
+           is small on a 32-bit platform.
+
+           Raises [Invalid_argument] when [n] is above
+           [Sys.max_array_length]. *)
+        if n > Sys.max_array_length then
+            invalid_arg "Buffer: more tokens than an array can hold";
+        let capacity =
+            min Sys.max_array_length
+                (max 8 (int_of_float (float_of_int n *. 1.618)))
+        in
+        let slots = Array.make capacity t in
+        Array.blit b.store.slots 0 slots 0 b.n_toks;
+        slots
+
+
+    let append_token (t: Token.t) (b: t): t =
+        let n = b.n_toks in
+        if n = b.store.used then begin
+            (* [b] is at the end of the store, so no other buffer value has
+               written slot [n]. Write it in place. *)
+            if n = Array.length b.store.slots then
+                b.store.slots <- with_capacity (n + 1) t b;
+            b.store.slots.(n) <- t;
+            b.store.used <- n + 1;
+            {b with n_toks = n + 1}
+        end
+        else begin
+            (* Another buffer value already wrote slot [n]. Keep that value
+               valid and give [b] its own store. *)
+            let slots = with_capacity (n + 1) t b in
+            slots.(n) <- t;
+            {b with store = {slots; used = n + 1}; n_toks = n + 1}
+        end
 
 
     let push_token (t: Token.t) (b: t): t =
@@ -146,9 +201,7 @@ struct
         else if b.is_buffering || has_lookahead b then
             (* In buffering mode or if there are lookahead token, the new token
                is pushed to the buffer. *)
-            {b with
-             toks =
-                 Array.push t b.toks}
+            append_token t b
 
         else
             (* Not in buffering mode an no lookaheads. We can forget all token
@@ -156,8 +209,10 @@ struct
             {b with
              la_ptr =
                  0;
-             toks =
-                 [|t|]}
+             store =
+                 {slots = [|t|]; used = 1};
+             n_toks =
+                 1}
 
 
     let push_end (b: t): t =
@@ -306,11 +361,14 @@ struct
             (* The current backtrackable parser is not nested within another
                backtrackable parser. We end buffering and forget all consumed
                token. The lookahead tokens remain in the buffer. *)
+            let toks = lookaheads b (* only lookahead token *) in
             {b with
              is_buffering =
                  false;
-             toks =
-                 lookaheads b; (* only lookahead token *)
+             store =
+                 {slots = toks; used = Array.length toks};
+             n_toks =
+                 Array.length toks;
              la_ptr =
                  0}
 
@@ -325,7 +383,8 @@ struct
         assert (b._end <> End_consumed);
         {
             b0 with
-            toks  = b.toks;
+            store = b.store;
+            n_toks = b.n_toks;
             _end  = b._end;
             error =
                 match e with
